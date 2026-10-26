@@ -62,7 +62,7 @@ object JwxtScheduleNormalizer {
         val notArranged = schedule.arrayOrEmpty("notArrangeList")
         val practice = schedule.arrayOrEmpty("practiceList")
 
-        val events = arranged.map { rawElement ->
+        val events = arranged.flatMap { rawElement ->
             val raw = rawElement.asJsonObject
             val weekday = raw.intOrZero("dayOfWeek")
             val details = raw.stringList("titleDetail")
@@ -104,8 +104,10 @@ object JwxtScheduleNormalizer {
                 details = details,
                 weekTeacherClassroomDetails = raw.stringList("titleWeekTeacherClassroomDetail")
             )
-            eventWithoutId.copy(id = eventId(eventWithoutId))
-        }.sortedWith(
+            expandArrangements(eventWithoutId).map { event ->
+                event.copy(id = eventId(event))
+            }
+        }.distinctBy { it.id }.sortedWith(
             compareBy(
                 { it.weekday },
                 { it.sections.start },
@@ -171,6 +173,70 @@ object JwxtScheduleNormalizer {
         )
     }
 
+    private fun expandArrangements(base: JwxtScheduleEvent): List<JwxtScheduleEvent> {
+        // JWXT may fold several week/teacher/room arrangements into one list item.
+        // Its top-level fields describe only the first arrangement.
+        val lines = base.weekTeacherClassroomDetails.filter { it.isNotBlank() }
+            .ifEmpty { base.details.filter { arrangementPrefix.containsMatchIn(it.trim()) } }
+        // Keep the structured fields (including the full teacher list) for ordinary items.
+        if (lines.size <= 1) return listOf(base)
+
+        val arrangements = lines.mapNotNull { line -> parseArrangement(line, base) }
+        if (arrangements.isEmpty()) return listOf(base)
+
+        // If a detail line is malformed, retain the original usable arrangement as well.
+        val events = if (arrangements.size < lines.size && arrangements.none {
+                it.weeks == base.weeks && it.classroom == base.classroom && it.campus == base.campus
+            }) {
+            listOf(base) + arrangements
+        } else {
+            arrangements
+        }
+        return events.distinctBy { eventId(it) }
+    }
+
+    private val detailWeekToken = """\d+(?:\s*[-~至]\s*\d+)?\s*(?:[单双]周|周(?:[（(]?[单双][）)]?)?)"""
+    private val arrangementPrefix = Regex("""^($detailWeekToken(?:\s*[,，]\s*$detailWeekToken)*)\s+""")
+    private val campusInDetail = Regex("""(?:^|\s)(\S+校区)(?:\s+|$)""")
+
+    private fun parseArrangement(line: String, base: JwxtScheduleEvent): JwxtScheduleEvent? {
+        val text = line.replace('\u00a0', ' ').replace('\u3000', ' ').trim()
+        val prefix = arrangementPrefix.find(text) ?: return null
+        val spec = prefix.groupValues[1].trim()
+        val weeks = expandWeeks(spec)
+        if (weeks.isEmpty()) return null
+        val remainder = text.substring(prefix.range.last + 1).trim()
+        val campusMatch = campusInDetail.find(remainder)
+        val teacherText: String
+        val campus: String
+        val classroom: String
+        if (campusMatch != null) {
+            teacherText = remainder.substring(0, campusMatch.range.first).trim()
+            campus = campusMatch.groupValues[1]
+            classroom = remainder.substring(campusMatch.range.last + 1).trim()
+        } else {
+            // Some JWXT responses omit the campus from the display detail.
+            val parts = remainder.split(Regex("""\s+"""), limit = 2)
+            if (parts.size != 2) return null
+            teacherText = parts[0]
+            campus = base.campus
+            classroom = parts[1].trim()
+        }
+        val detailTeachers = teacherText.replace(Regex("""\[[^\]]*\]"""), "")
+            .split(Regex("""[,，、]\s*"""))
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+        return base.copy(
+            campus = campus,
+            classroom = classroom,
+            weekSpec = spec,
+            weeks = weeks,
+            teachers = detailTeachers,
+            weekTeacherClassroomDetails = listOf(line)
+        )
+    }
+
     private fun weekSpec(raw: String): String {
         val prefix = raw.split("/", limit = 2).first()
         return prefix.replace(Regex("""\[[^\]]*\]"""), "").trim()
@@ -195,7 +261,9 @@ object JwxtScheduleNormalizer {
             append(";startSection=").append(event.sections.start)
             append(";endSection=").append(event.sections.end)
             append(";weekSpec=").append(event.weekSpec)
+            append(";campus=").append(event.campus)
             append(";classroom=").append(event.classroom)
+            append(";teachers=").append(event.teachers.sorted().joinToString(","))
         }
         val digest = MessageDigest.getInstance("SHA-256").digest(identity.toByteArray(Charsets.UTF_8))
         return digest.joinToString("") { "%02x".format(it) }.take(20)
